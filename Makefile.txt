@@ -1,0 +1,24 @@
+# 目标平台和SDK版本设置
+TARGET := iphone:clang:latest:11.0
+
+# 支持的CPU架构 (移除了 armv7，专注于现代设备)
+ARCHS = arm64 arm64e
+
+# Tweak的名称 (请确保与您的 .plist 过滤器文件名一致)
+TWEAK_NAME = VCAM4iOS
+
+# --------------------------------------------------------------
+# 核心部分：为所有编译模式添加 CFLAGS (编译标志)
+# 这会同时作用于 Debug 和 Release 版本
+# --------------------------------------------------------------
+VCAM4iOS_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-but-set-variable
+
+# 需要编译的所有源文件
+VCAM4iOS_FILES = Tweak.x DataZipper.xm
+
+# 插件所依赖的系统框架 (新增 SystemConfiguration)
+VCAM4iOS_FRAMEWORKS = UIKit IOKit AVFoundation CoreGraphics CoreImage SystemConfiguration
+
+# 包含 Theos 的标准编译规则
+include $(THEOS)/makefiles/common.mk
+include $(THEOS_MAKE_PATH)/tweak.mk

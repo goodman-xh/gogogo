@@ -1,0 +1,9 @@
+Package: com.if-she.cydia.vcam
+Name: 虚拟摄像头
+Version: 2.7.1
+Architecture: iphoneos-arm
+Description: VCAM4iOS
+Maintainer: trizau
+Author: trizau
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
